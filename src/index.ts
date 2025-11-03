@@ -192,6 +192,38 @@ async function testConnection(): Promise<boolean> {
 }
 
 /**
+ * Initialize database schema - creates table and index if they don't exist
+ */
+async function initializeSchema(): Promise<void> {
+  return retryWithBackoff(async () => {
+    const client = await getClientWithRetry();
+    
+    try {
+      // Create solPrice table if it doesn't exist
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS solPrice (
+          id SERIAL PRIMARY KEY,
+          price DECIMAL(20, 8) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      
+      // Create index on created_at if it doesn't exist
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_solPrice_created_at ON solPrice(created_at)
+      `);
+      
+      console.log('✓ Database schema initialized');
+    } catch (error) {
+      console.error('Error initializing database schema:', error);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }, 'Initialize database schema');
+}
+
+/**
  * Main entry point
  */
 async function main() {
@@ -203,6 +235,9 @@ async function main() {
     console.error('Cannot proceed without database connection. Please check your .env file.');
     process.exit(1);
   }
+  
+  // Initialize database schema (create table if not exists)
+  await initializeSchema();
   
   // Fetch and save price immediately
   await fetchAndSaveSolPrice();
