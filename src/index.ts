@@ -45,7 +45,7 @@ async function initializeRedis() {
 
     redisClient = createClient({ url: redisUrl });
 
-    redisClient.on('error', (err) => {
+    redisClient.on('error', (err: Error) => {
       console.error('Redis Client Error:', err);
     });
 
