@@ -244,6 +244,120 @@ interface PriceBufferItem {
 }
 const postgresBuffer = new Map<string, PriceBufferItem>(); // Key: mintAddress, Value: latest price data
 
+// Price validation: Track recent prices to detect anomalies
+interface RecentPriceEntry {
+  priceUsd: number;
+  timestamp: number;
+}
+const recentPriceHistory = new Map<string, RecentPriceEntry[]>(); // Key: mintAddress, Value: array of recent prices
+const PRICE_VALIDATION_WINDOW_MS = 30000; // 30 seconds window
+const MAX_PRICE_CHANGE_MULTIPLIER = 10; // 10x change threshold
+const MAX_HISTORY_ENTRIES = 10; // Keep last 10 prices per token (reduced for performance)
+const PRICE_CHECK_COUNT = 3; // Only check against last 3 prices for faster validation
+
+/**
+ * Validate price change - skip if price changes more than 10x within short interval
+ * Optimized for frequent updates: only checks last few prices, lazy cleanup
+ * Returns true if price is valid (should be saved), false if it should be skipped
+ */
+function validatePriceChange(mintAddress: string, newPriceUsd: number): boolean {
+  const now = Date.now();
+  const windowStart = now - PRICE_VALIDATION_WINDOW_MS;
+  
+  // Get recent price history for this token
+  let history = recentPriceHistory.get(mintAddress);
+  
+  // If no recent history, allow the price (first price for this token)
+  if (!history || history.length === 0) {
+    recentPriceHistory.set(mintAddress, [{ priceUsd: newPriceUsd, timestamp: now }]);
+    return true;
+  }
+  
+  // Lazy cleanup: remove old entries only if we have many entries (optimization)
+  // Full cleanup happens periodically, this is just to prevent unbounded growth
+  if (history.length > MAX_HISTORY_ENTRIES) {
+    history = history.filter(entry => entry.timestamp >= windowStart);
+    // If all were old, start fresh
+    if (history.length === 0) {
+      recentPriceHistory.set(mintAddress, [{ priceUsd: newPriceUsd, timestamp: now }]);
+      return true;
+    }
+  }
+  
+  // Optimized: Only check against the most recent prices (last PRICE_CHECK_COUNT entries)
+  // This is much faster than checking all prices, especially for frequent updates
+  const checkCount = Math.min(PRICE_CHECK_COUNT, history.length);
+  const startIndex = history.length - checkCount;
+  
+  for (let i = startIndex; i < history.length; i++) {
+    const entry = history[i];
+    const oldPrice = entry.priceUsd;
+    
+    // Skip if old price is 0 or invalid, or if entry is too old
+    if (oldPrice <= 0 || entry.timestamp < windowStart) continue;
+    
+    // Optimized comparison: check if ratio exceeds threshold
+    // Using multiplication instead of division for better performance
+    if (newPriceUsd > oldPrice * MAX_PRICE_CHANGE_MULTIPLIER || 
+        oldPrice > newPriceUsd * MAX_PRICE_CHANGE_MULTIPLIER) {
+      const changeRatio = newPriceUsd / oldPrice;
+      const inverseRatio = oldPrice / newPriceUsd;
+      console.warn(
+        `⚠ Skipping suspicious price for ${mintAddress}: ` +
+        `$${newPriceUsd.toFixed(2)} (previous: $${oldPrice.toFixed(2)}, ` +
+        `change: ${changeRatio > MAX_PRICE_CHANGE_MULTIPLIER ? changeRatio.toFixed(2) : inverseRatio.toFixed(2)}x)`
+      );
+      return false;
+    }
+  }
+  
+  // Price is valid, add to history
+  history.push({ priceUsd: newPriceUsd, timestamp: now });
+  
+  // Efficiently limit history size by removing oldest entries
+  if (history.length > MAX_HISTORY_ENTRIES) {
+    // Remove oldest entries, keeping only the most recent ones
+    history = history.slice(-MAX_HISTORY_ENTRIES);
+  }
+  
+  recentPriceHistory.set(mintAddress, history);
+  return true;
+}
+
+/**
+ * Clean up old price history entries (called periodically)
+ * Optimized: only processes entries that likely need cleanup
+ */
+function cleanupPriceHistory(): void {
+  const now = Date.now();
+  const windowStart = now - PRICE_VALIDATION_WINDOW_MS;
+  
+  // Use for...of with entries() for better performance than forEach
+  for (const [mintAddress, history] of recentPriceHistory.entries()) {
+    // Skip if history is small and recent (optimization)
+    if (history.length <= 2) {
+      // Only check if the oldest entry is still valid
+      if (history.length > 0 && history[0].timestamp < windowStart) {
+        recentPriceHistory.delete(mintAddress);
+      }
+      continue;
+    }
+    
+    // Only filter if we have many entries or the oldest entry is old
+    if (history.length > MAX_HISTORY_ENTRIES || history[0].timestamp < windowStart) {
+      const filteredHistory = history.filter(entry => entry.timestamp >= windowStart);
+      
+      if (filteredHistory.length === 0) {
+        // Remove token entry if no recent history
+        recentPriceHistory.delete(mintAddress);
+      } else if (filteredHistory.length < history.length) {
+        // Only update if we actually removed entries
+        recentPriceHistory.set(mintAddress, filteredHistory);
+      }
+    }
+  }
+}
+
 /**
  * Clean up old entries from Redis (older than 5 minutes)
  * Can be called periodically or on each write
@@ -512,6 +626,8 @@ async function processTradeData(trades: TradeData[], receiveTime: number): Promi
   // Pre-process all trade data and add to buffer (saves every 1 second)
   const processedCount = uniqueTrades.length;
   
+  let skippedCount = 0;
+  
   for (const trade of uniqueTrades) {
     const {
       Trade: {
@@ -528,6 +644,12 @@ async function processTradeData(trades: TradeData[], receiveTime: number): Promi
       priceUsd: typeof PriceInUSD === 'number' ? PriceInUSD : parseFloat(String(PriceInUSD)),
       blockTime: Block.allTime ? new Date(Block.allTime) : new Date(),
     };
+    
+    // Validate price change - skip if suspicious (more than 10x change)
+    if (!validatePriceChange(priceData.mintAddress, priceData.priceUsd)) {
+      skippedCount++;
+      continue;
+    }
     
     // Add to buffer (only latest price per mint_address is kept)
     // Store in Redis immediately (real-time for Redis)
@@ -549,8 +671,9 @@ async function processTradeData(trades: TradeData[], receiveTime: number): Promi
   
   // Single summary log
   console.log(
-    `✓ Buffered ${processedCount} trade(s)` +
+    `✓ Buffered ${processedCount - skippedCount} trade(s)` +
     (filteredCount > 0 ? ` (filtered ${filteredCount} duplicates)` : '') +
+    (skippedCount > 0 ? ` (skipped ${skippedCount} suspicious prices)` : '') +
     ` in ${processingDuration}ms (total: ${totalDuration}ms from receive) - Buffer size: ${postgresBuffer.size}`
   );
 }
@@ -789,6 +912,12 @@ async function main() {
     });
   }, 1000); // Run every 1 second
   console.log('✓ PostgreSQL batch flush started (every 1 second)');
+
+  // Start periodic price history cleanup (every 30 seconds)
+  setInterval(() => {
+    cleanupPriceHistory();
+  }, 30000); // Run every 30 seconds
+  console.log('✓ Price history cleanup started (every 30 seconds)');
 
   // Connect to Bitquery WebSocket
   connectToBitquery();
